@@ -1,0 +1,44 @@
+name: rs-wrk
+version: "0.1.0"
+
+args:
+  - url:
+      help: benchmark target
+      index: 1
+      required: true
+  - connections:
+      short: c
+      long: connections
+      help: total number of HTTP connections to keep open with each thread handling N = connections/threads
+      default_value: "1"
+      takes_value: true
+  - duration:
+      short: d
+      long: duration
+      help: duration of the test in seconds
+      default_value: "10"
+      takes_value: true
+  - threads:
+      short: t
+      long: threads
+      help: total number of threads to use
+      default_value: "1"
+      takes_value: true
+  - script:
+      short: s
+      long: script
+      help: LuaJIT script, see SCRIPTING
+      takes_value: true
+  - header:
+      short: H
+      long: header
+      help: 'HTTP header to add to request, e.g. "User-Agent: wrk"'
+      takes_value: true
+  - latency:
+      long: latency
+      help: print detailed latency statistics
+      takes_value: true
+  - timeout:
+      long: timeout
+      help: record a timeout if a response is not received within this amount of time.
+      takes_value: true
