@@ -9,6 +9,8 @@ clap = { version = "2.32", features = ["yaml"] }
 crossbeam-channel = "0.3"
 crossbeam-utils = "0.6"
 ctrlc = "3.1"
+futures = "0.1"
 hdrhistogram = "6.1"
 reqwest = "0.9"
+tokio = "0.1"
 url = "1.7"

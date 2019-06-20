@@ -1,16 +1,22 @@
 extern crate clap;
 extern crate crossbeam_channel;
 extern crate ctrlc;
-extern crate hdrhistogram;
+extern crate futures;
 extern crate reqwest;
+extern crate tokio;
 extern crate url;
 
 use clap::{load_yaml, value_t, value_t_or_exit, App};
 use crossbeam_channel::{bounded, select, Receiver, Sender};
 use crossbeam_utils::sync::WaitGroup;
+
+use futures::{Async, Future, Poll, Stream};
 use hdrhistogram::Histogram;
 use reqwest::header::HeaderMap;
-use reqwest::{Client, Response};
+use reqwest::r#async::{Client, Response};
+use reqwest::Error;
+use tokio::prelude::*;
+use tokio::timer::Delay;
 use url::Url;
 
 use std::collections::HashMap;
@@ -18,8 +24,17 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
+    let (tx, rx) = bounded(100);
+    ctrlc::set_handler(move || {
+        let _ = tx.send(());
+    })?;
+
+    Ok(rx)
+}
+
 #[derive(Debug, Clone)]
-struct RunnerConfig {
+struct Config {
     pub url: url::Url,
     pub connections: u32,
     pub duration: Duration,
@@ -31,46 +46,92 @@ struct RunnerConfig {
 struct Load {
     pub start_time: Instant,
     pub end_time: Instant,
-    pub response: reqwest::Result<Response>,
+    pub response: Response,
 }
 
-fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
-    let (tx, rx) = bounded(100);
-    ctrlc::set_handler(move || {
-        let _ = tx.send(());
-    })?;
+struct LoadRunner {
+    url: url::Url,
+    duration_delay: Delay,
 
-    Ok(rx)
+    http_client: Client,
+    ctrlc_rx: Receiver<()>,
+    resp_tx: Sender<Load>,
+
+    ongoing_start_time: Option<Instant>,
+    ongoing_request: Option<Box<Future<Item = Response, Error = Error>>>,
+
+    counter: u64,
 }
 
-fn load_runner(tx: Sender<Load>, ctrlc_rx: Receiver<()>, config: RunnerConfig) {
-    let t = Instant::now();
-    let client = Client::builder()
-        .timeout(config.timeout)
-        .max_idle_per_host(config.connections as usize)
-        .build()
-        .unwrap();
+impl LoadRunner {
+    pub fn new(config: Config, ctrlc_rx: Receiver<()>, resp_tx: Sender<Load>) -> LoadRunner {
+        let client = Client::builder()
+            .timeout(config.timeout.unwrap_or(Duration::from_secs(10)))
+            .max_idle_per_host(config.connections as usize)
+            .build()
+            .unwrap();
 
-    loop {
-        if t.elapsed() > config.duration {
-            return;
-        }
-        select! {
-            recv(ctrlc_rx) -> _ => {
-                return
-            },
-            default => {
-                let start_time = Instant::now();
-                let response = client.get(config.url.as_str()).send();
-                let load = Load{
-                    start_time,
-                    end_time: Instant::now(),
-                    response,
-                };
-                tx.send(load).unwrap();
-            },
+        LoadRunner {
+            http_client: client,
+            url: config.url.clone(),
+            duration_delay: Delay::new(Instant::now() + config.duration),
+            ctrlc_rx,
+            resp_tx,
+            ongoing_start_time: None,
+            ongoing_request: None,
+            counter: 0,
         }
     }
+}
+
+impl Stream for LoadRunner {
+    type Item = ();
+    type Error = ();
+
+    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+        loop {
+            select! {
+                recv(self.ctrlc_rx) -> _ => return Ok(Async::Ready(None)),
+                default => {},
+            }
+
+            match self.duration_delay.poll() {
+                Ok(Async::Ready(_)) => return Ok(Async::Ready(None)),
+                Ok(Async::NotReady) => (),
+                Err(_) => return Err(()),
+            };
+
+            if self.ongoing_request.is_none() {
+                self.ongoing_start_time = Some(Instant::now());
+                self.ongoing_request = Some(Box::new(self.http_client.get(self.url.as_str()).send()));
+            }
+            if let Some(ref mut inner) = self.ongoing_request {
+                match inner.poll() {
+                    Ok(Async::Ready(resp)) => {
+                        self.counter += 1;
+                        let _ = self.resp_tx.send(Load {
+                            start_time: self.ongoing_start_time.unwrap(),
+                            end_time: Instant::now(),
+                            response: resp,
+                        });
+                        self.ongoing_request = None;
+                        return Ok(Async::Ready(Some(())));
+                    }
+                    Ok(Async::NotReady) => return Ok(Async::NotReady),
+                    Err(_) => self.ongoing_request = None,
+                };
+            }
+        }
+    }
+}
+
+fn run(tx: Sender<Load>, ctrlc_rx: Receiver<()>, config: Config) {
+    let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
+
+    let runner = LoadRunner::new(config, ctrlc_rx, tx);
+    rt.spawn(runner.for_each(|_| Ok(())));
+
+    let _ = rt.run();
 }
 
 fn main() {
@@ -97,7 +158,7 @@ fn main() {
         Err(_) => None,
     };
 
-    let runner_config = RunnerConfig {
+    let runner_config = Config {
         url: url.clone(),
         connections: conn_per_thread as u32,
         duration,
@@ -138,7 +199,7 @@ fn main() {
         let config = runner_config.clone();
 
         thread::spawn(move || {
-            load_runner(tx, ctrlc_events, config);
+            run(tx, ctrlc_events, config);
             drop(wg);
         });
     }
@@ -155,22 +216,16 @@ fn main() {
                 return
             },
             default => {
-                while let Some(load) = rx.try_iter().next() {
+                while let Some(mut load) = rx.try_iter().next() {
                     *count += 1;
                     let latency = load.end_time - load.start_time;
                     hist.record(latency.as_millis() as u64).unwrap();
 
-                    match load.response {
-                        Ok(mut response) => {
-                            let counter = status_codes.entry(response.status()).or_insert(0);
-                            *counter += 1;
+                    let counter = status_codes.entry(load.response.status()).or_insert(0);
+                    *counter += 1;
 
-                            let mut buf: Vec<u8> = vec![];
-                            let len = response.copy_to(&mut buf).unwrap_or(0);
-                            *size += len;
-                        }
-                        Err(e) => println!("{:?}", e),
-                    }
+                    let len = load.response.body_mut().concat2().wait().unwrap().bytes().count();
+                    *size += len;
                 }
             },
         }
@@ -180,10 +235,11 @@ fn main() {
     wg.wait();
 
     let h = hist.read().unwrap();
+    let total_requests: u64 = *request_count.read().unwrap();
     println!("Result:");
     println!(
         "\t{} requests in {:?}, {} bytes read",
-        request_count.read().unwrap(),
+        total_requests,
         t.elapsed(),
         response_size.read().unwrap()
     );
@@ -198,6 +254,6 @@ fn main() {
 
     println!("\tResponse Status: ");
     for (k, v) in status_codes.read().unwrap().iter() {
-        println!("\t\t{}: {}", k, v);
+        println!("\t\t{}: {}({:.2}%)", k, v, v / total_requests * 100);
     }
 }
