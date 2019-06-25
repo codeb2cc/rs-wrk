@@ -49,6 +49,8 @@ struct Load {
     pub response: Response,
 }
 
+type OngoingRequest = (Instant, Box<Future<Item = Response, Error = Error>>);
+
 struct LoadRunner {
     url: url::Url,
     duration_delay: Delay,
@@ -57,19 +59,26 @@ struct LoadRunner {
     ctrlc_rx: Receiver<()>,
     resp_tx: Sender<Load>,
 
-    ongoing_start_time: Option<Instant>,
-    ongoing_request: Option<Box<Future<Item = Response, Error = Error>>>,
+    ongoing_requests: Vec<Option<OngoingRequest>>,
 
-    counter: u64,
+    request_count: u64,
+    response_count: u64,
+    error_count: u64,
 }
 
 impl LoadRunner {
     pub fn new(config: Config, ctrlc_rx: Receiver<()>, resp_tx: Sender<Load>) -> LoadRunner {
+        let concurrency = config.connections as usize;
         let client = Client::builder()
             .timeout(config.timeout.unwrap_or(Duration::from_secs(10)))
-            .max_idle_per_host(config.connections as usize)
+            .max_idle_per_host(concurrency)
             .build()
             .unwrap();
+
+        let mut ongoing_requests = Vec::with_capacity(concurrency);
+        for _ in 0..concurrency {
+            ongoing_requests.push(None);
+        }
 
         LoadRunner {
             http_client: client,
@@ -77,9 +86,10 @@ impl LoadRunner {
             duration_delay: Delay::new(Instant::now() + config.duration),
             ctrlc_rx,
             resp_tx,
-            ongoing_start_time: None,
-            ongoing_request: None,
-            counter: 0,
+            ongoing_requests,
+            request_count: 0,
+            response_count: 0,
+            error_count: 0,
         }
     }
 }
@@ -89,38 +99,56 @@ impl Stream for LoadRunner {
     type Error = ();
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        loop {
-            select! {
-                recv(self.ctrlc_rx) -> _ => return Ok(Async::Ready(None)),
-                default => {},
-            }
+        select! {
+            // Receive Ctrl+C and close stream.
+            recv(self.ctrlc_rx) -> _ => return Ok(Async::Ready(None)),
+            default => {},
+        }
 
-            match self.duration_delay.poll() {
-                Ok(Async::Ready(_)) => return Ok(Async::Ready(None)),
-                Ok(Async::NotReady) => (),
-                Err(_) => return Err(()),
-            };
+        match self.duration_delay.poll() {
+            // Test ends and close stream.
+            Ok(Async::Ready(_)) => return Ok(Async::Ready(None)),
+            Ok(Async::NotReady) => (),
+            Err(_) => return Err(()),
+        };
 
-            if self.ongoing_request.is_none() {
-                self.ongoing_start_time = Some(Instant::now());
-                self.ongoing_request = Some(Box::new(self.http_client.get(self.url.as_str()).send()));
+        // Make new request if the old one is finished(None).
+        for request in self.ongoing_requests.iter_mut() {
+            if request.is_none() {
+                *request = Some((Instant::now(), Box::new(self.http_client.get(self.url.as_str()).send())));
+                self.request_count += 1;
             }
-            if let Some(ref mut inner) = self.ongoing_request {
-                match inner.poll() {
+        }
+
+        let mut some_done = false;
+        for request in self.ongoing_requests.iter_mut() {
+            if let Some((time, ft)) = request {
+                match ft.poll() {
                     Ok(Async::Ready(resp)) => {
-                        self.counter += 1;
+                        self.response_count += 1;
                         let _ = self.resp_tx.send(Load {
-                            start_time: self.ongoing_start_time.unwrap(),
+                            start_time: *time,
                             end_time: Instant::now(),
                             response: resp,
                         });
-                        self.ongoing_request = None;
-                        return Ok(Async::Ready(Some(())));
+
+                        *request = None;
+                        some_done = true;
                     }
-                    Ok(Async::NotReady) => return Ok(Async::NotReady),
-                    Err(_) => self.ongoing_request = None,
+                    Ok(Async::NotReady) => {}
+                    Err(_) => {
+                        self.error_count += 1;
+                        *request = None;
+                    }
                 };
             }
+        }
+
+        if some_done {
+            // As a TICK to inform outter poller.
+            Ok(Async::Ready(Some(())))
+        } else {
+            Ok(Async::NotReady)
         }
     }
 }
@@ -150,7 +178,6 @@ fn main() {
 
     let threads = value_t_or_exit!(args.value_of("threads"), u32);
     let connections = value_t_or_exit!(args.value_of("connections"), u32);
-    let conn_per_thread = (connections as f64 / threads as f64).ceil();
     let duration_seconds = value_t_or_exit!(args.value_of("duration"), u32);
     let duration = Duration::new(duration_seconds as u64, 0);
     let timeout = match value_t!(args.value_of("timeout"), u32) {
@@ -160,17 +187,17 @@ fn main() {
 
     let runner_config = Config {
         url: url.clone(),
-        connections: conn_per_thread as u32,
+        connections,
         duration,
         headers: HeaderMap::new(),
         timeout,
     };
     println!(
-        "=> Running {:?} test @ {}\n\t{} threads and {} connections",
+        "=> Running {:?} test @ {}\n\t{} threads and {} connections per thread",
         duration,
         url.as_str(),
         threads,
-        std::cmp::max(connections, threads),
+        connections,
     );
 
     let hist = match timeout {
