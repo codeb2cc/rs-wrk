@@ -25,9 +25,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
-    let (tx, rx) = bounded(100);
+    let (tx, rx) = bounded(1);
     ctrlc::set_handler(move || {
-        let _ = tx.send(());
+        loop {
+            let _ = tx.send(());
+        }
     })?;
 
     Ok(rx)
