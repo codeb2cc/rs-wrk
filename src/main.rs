@@ -6,30 +6,29 @@ extern crate reqwest;
 extern crate tokio;
 extern crate url;
 
-use clap::{load_yaml, value_t, value_t_or_exit, App};
-use crossbeam_channel::{bounded, select, Receiver, Sender};
-use crossbeam_utils::sync::WaitGroup;
+use std::collections::HashMap;
+use std::mem;
+use std::sync::{Arc, RwLock};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use clap::{load_yaml, value_t, value_t_or_exit, App};
+use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError};
+use crossbeam_utils::sync::WaitGroup;
+use futures::stream::Concat2;
 use futures::{Async, Future, Poll, Stream};
 use hdrhistogram::Histogram;
 use reqwest::header::HeaderMap;
-use reqwest::r#async::{Client, Response};
+use reqwest::r#async::{Client, Decoder, Response};
 use reqwest::Error;
 use tokio::prelude::*;
 use tokio::timer::Delay;
 use url::Url;
 
-use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
-use std::thread;
-use std::time::{Duration, Instant};
-
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
     let (tx, rx) = bounded(1);
-    ctrlc::set_handler(move || {
-        loop {
-            let _ = tx.send(());
-        }
+    ctrlc::set_handler(move || loop {
+        let _ = tx.send(());
     })?;
 
     Ok(rx)
@@ -44,14 +43,23 @@ struct Config {
     pub timeout: Option<Duration>,
 }
 
-#[derive(Debug)]
-struct Load {
-    pub start_time: Instant,
-    pub end_time: Instant,
-    pub response: Response,
+#[derive(Debug, Clone)]
+struct ResponseInfo {
+    code: reqwest::StatusCode,
+    time: Duration,
+    content_lenght: u64,
 }
 
-type OngoingRequest = (Instant, Box<Future<Item = Response, Error = Error>>);
+type OngoingRequest = (
+    // Request time
+    Instant,
+    // Response future
+    Box<Future<Item = Response, Error = Error>>,
+    // Response Status
+    Option<reqwest::StatusCode>,
+    // Response body future
+    Option<Concat2<Decoder>>,
+);
 
 struct LoadRunner {
     url: url::Url,
@@ -59,7 +67,7 @@ struct LoadRunner {
 
     http_client: Client,
     ctrlc_rx: Receiver<()>,
-    resp_tx: Sender<Load>,
+    resp_tx: Sender<ResponseInfo>,
 
     ongoing_requests: Vec<Option<OngoingRequest>>,
 
@@ -69,7 +77,7 @@ struct LoadRunner {
 }
 
 impl LoadRunner {
-    pub fn new(config: Config, ctrlc_rx: Receiver<()>, resp_tx: Sender<Load>) -> LoadRunner {
+    pub fn new(config: Config, ctrlc_rx: Receiver<()>, resp_tx: Sender<ResponseInfo>) -> LoadRunner {
         let concurrency = config.connections as usize;
         let client = Client::builder()
             .timeout(config.timeout.unwrap_or(Duration::from_secs(10)))
@@ -102,13 +110,13 @@ impl Stream for LoadRunner {
 
     fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
         select! {
-            // Receive Ctrl+C and close stream.
+            // Receive Ctrl+C event and close stream.
             recv(self.ctrlc_rx) -> _ => return Ok(Async::Ready(None)),
             default => {},
         }
 
         match self.duration_delay.poll() {
-            // Test ends and close stream.
+            // Benchmark ends and close stream.
             Ok(Async::Ready(_)) => return Ok(Async::Ready(None)),
             Ok(Async::NotReady) => (),
             Err(_) => return Err(()),
@@ -117,37 +125,58 @@ impl Stream for LoadRunner {
         // Make new request if the old one is finished(None).
         for request in self.ongoing_requests.iter_mut() {
             if request.is_none() {
-                *request = Some((Instant::now(), Box::new(self.http_client.get(self.url.as_str()).send())));
+                *request = Some((
+                    Instant::now(),
+                    Box::new(self.http_client.get(self.url.as_str()).send()),
+                    None,
+                    None,
+                ));
                 self.request_count += 1;
             }
         }
 
-        let mut some_done = false;
+        let mut some_done = false; // Flag to next poll(Async::NotReady)
         for request in self.ongoing_requests.iter_mut() {
-            if let Some((time, ft)) = request {
-                match ft.poll() {
-                    Ok(Async::Ready(resp)) => {
-                        self.response_count += 1;
-                        let _ = self.resp_tx.send(Load {
-                            start_time: *time,
-                            end_time: Instant::now(),
-                            response: resp,
-                        });
-
-                        *request = None;
-                        some_done = true;
+            if let Some((start_time, ft, status_code, ft2)) = request {
+                if let Some(resp) = ft2 {
+                    // Response received, continue to read body
+                    match resp.poll() {
+                        Ok(Async::Ready(data)) => {
+                            let _ = self.resp_tx.send(ResponseInfo {
+                                code: status_code.unwrap_or(reqwest::StatusCode::OK),
+                                time: Instant::now() - *start_time,
+                                content_lenght: data.bytes().count() as u64,
+                            });
+                            *request = None;
+                            some_done = true;
+                        }
+                        Ok(Async::NotReady) => {}
+                        Err(_) => {
+                            self.error_count += 1;
+                            *request = None;
+                        }
                     }
-                    Ok(Async::NotReady) => {}
-                    Err(_) => {
-                        self.error_count += 1;
-                        *request = None;
-                    }
-                };
+                } else {
+                    // Process request
+                    match ft.poll() {
+                        Ok(Async::Ready(mut resp)) => {
+                            self.response_count += 1;
+                            let body = mem::replace(resp.body_mut(), Decoder::empty());
+                            *status_code = Some(resp.status());
+                            *ft2 = Some(body.concat2());
+                            some_done = true;
+                        }
+                        Ok(Async::NotReady) => {}
+                        Err(_) => {
+                            self.error_count += 1;
+                            *request = None;
+                        }
+                    };
+                }
             }
         }
 
         if some_done {
-            // As a TICK to inform outter poller.
             Ok(Async::Ready(Some(())))
         } else {
             Ok(Async::NotReady)
@@ -155,7 +184,7 @@ impl Stream for LoadRunner {
     }
 }
 
-fn run(tx: Sender<Load>, ctrlc_rx: Receiver<()>, config: Config) {
+fn run(tx: Sender<ResponseInfo>, ctrlc_rx: Receiver<()>, config: Config) {
     let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
 
     let runner = LoadRunner::new(config, ctrlc_rx, tx);
@@ -181,13 +210,13 @@ fn main() {
     let threads = value_t_or_exit!(args.value_of("threads"), u32);
     let connections = value_t_or_exit!(args.value_of("connections"), u32);
     let duration_seconds = value_t_or_exit!(args.value_of("duration"), u32);
-    let duration = Duration::new(duration_seconds as u64, 0);
+    let duration = Duration::new(u64::from(duration_seconds), 0);
     let timeout = match value_t!(args.value_of("timeout"), u32) {
-        Ok(seconds) => Some(Duration::new(seconds as u64, 0)),
+        Ok(seconds) => Some(Duration::new(u64::from(seconds), 0)),
         Err(_) => None,
     };
 
-    let runner_config = Config {
+    let load_config = Config {
         url: url.clone(),
         connections,
         duration,
@@ -211,67 +240,82 @@ fn main() {
     let hist_th = hist.clone();
 
     let status_codes = Arc::new(RwLock::new(HashMap::<reqwest::StatusCode, u64>::new()));
-    let status_codes_th = status_codes.clone();
-
     let request_count = Arc::new(RwLock::new(0));
-    let request_count_th = request_count.clone();
     let response_size = Arc::new(RwLock::new(0));
-    let response_size_th = response_size.clone();
     let t = Instant::now();
 
     let wg = WaitGroup::new();
-    let (tx, rx) = crossbeam_channel::unbounded::<Load>();
+    let (tx, rx) = crossbeam_channel::bounded::<ResponseInfo>(1024);
     for _ in 0..threads {
         let wg = wg.clone();
         let tx = tx.clone();
         let ctrlc_events = ctrlc_events.clone();
-        let config = runner_config.clone();
+        let config = load_config.clone();
 
         thread::spawn(move || {
             run(tx, ctrlc_events, config);
             drop(wg);
         });
     }
+    // Drop TX in main thread and when all load threads exit the channel will
+    // become disconnected. Then the statisitic thread receives correct Err and
+    // exits.
+    drop(tx);
 
-    // Summarize responses
-    thread::spawn(move || loop {
+    let status_codes_th = status_codes.clone();
+    let request_count_th = request_count.clone();
+    let response_size_th = response_size.clone();
+    // Thread to summarize responses statisitic
+    thread::spawn(move ||  {
         let mut hist = hist_th.write().unwrap();
-        let mut status_codes = status_codes_th.write().unwrap();
+        let mut codes = status_codes_th.write().unwrap();
         let mut count = request_count_th.write().unwrap();
         let mut size = response_size_th.write().unwrap();
 
-        select! {
-            recv(ctrlc_events) -> _ => {
-                return
-            },
-            default => {
-                while let Some(mut load) = rx.try_iter().next() {
-                    *count += 1;
-                    let latency = load.end_time - load.start_time;
-                    hist.record(latency.as_millis() as u64).unwrap();
-
-                    let counter = status_codes.entry(load.response.status()).or_insert(0);
-                    *counter += 1;
-
-                    let len = load.response.body_mut().concat2().wait().unwrap().bytes().count();
-                    *size += len;
-                }
-            },
+        loop {
+            select! {
+                recv(ctrlc_events) -> _ => {
+                    return
+                },
+                default => loop {
+                    match rx.try_recv() {
+                        Ok(info) => {
+                            *count += 1;
+                            let latency = info.time;
+                            hist.record(latency.as_millis() as u64).unwrap_or(());
+                            let counter = codes.entry(info.code).or_insert(0);
+                            *counter += 1;
+                            *size += info.content_lenght;
+                        }
+                        Err(TryRecvError::Empty) => break,
+                        Err(TryRecvError::Disconnected) => return,
+                    }
+                },
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(10));
     });
 
     wg.wait();
 
     let h = hist.read().unwrap();
     let total_requests: u64 = *request_count.read().unwrap();
+    let total_bytes: u64 = *response_size.read().unwrap();
+    let elapsed = t.elapsed();
     println!("Result:");
     println!(
         "\t{} requests in {:?}, {} bytes read",
-        total_requests,
-        t.elapsed(),
-        response_size.read().unwrap()
+        total_requests, elapsed, total_bytes,
     );
+    println!(
+        "\tQPS:        \t{:.2} [#/sec]",
+        total_requests as f64 / elapsed.as_secs() as f64
+    );
+    println!(
+        "\tThroughput: \t{:.2} [Kbytes/sec]",
+        total_bytes as f64 / 1024.0 / elapsed.as_secs() as f64
+    );
+    println!();
     println!("\tLatency\tMean\tStdev\tMax\tP99");
     println!(
         "\t\t{:.2}ms\t{:.2}ms\t{:.2}ms\t{:.2}ms",
