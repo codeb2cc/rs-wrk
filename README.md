@@ -1,6 +1,9 @@
 RS-WRK
 ====
 
+[![Build Status](https://travis-ci.org/codeb2cc/rs-wrk.svg?branch=master)](https://travis-ci.org/codeb2cc/rs-wrk)
+[![codecov](https://codecov.io/gh/codeb2cc/rs-wrk/branch/master/graph/badge.svg?token=wIPUy1LeMP)](https://codecov.io/gh/codeb2cc/rs-wrk)
+
 A wrk like HTTP benchmarking tool in Rust.
 
 Usage

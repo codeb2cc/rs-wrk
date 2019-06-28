@@ -2,5 +2,6 @@
 **/*.rs.bk
 
 .vscode
+cobertura.xml
 perf.data*
 flamegraph.svg
