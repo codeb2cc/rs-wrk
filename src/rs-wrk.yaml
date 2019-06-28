@@ -24,16 +24,13 @@ args:
       help: total number of threads to use
       default_value: "1"
       takes_value: true
-  - script:
-      short: s
-      long: script
-      help: LuaJIT script, see SCRIPTING
-      takes_value: true
   - header:
       short: H
       long: header
       help: 'HTTP header to add to request, e.g. "User-Agent: wrk"'
       takes_value: true
+      multiple: true
+      number_of_values: 1
   - latency:
       long: latency
       help: print detailed latency statistics

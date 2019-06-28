@@ -23,7 +23,6 @@ OPTIONS:
     -d, --duration <duration>          duration of the test in seconds [default: 10]
     -H, --header <header>              HTTP header to add to request, e.g. "User-Agent: wrk"
         --latency <latency>            print detailed latency statistics
-    -s, --script <script>              LuaJIT script, see SCRIPTING
     -t, --threads <threads>            total number of threads to use [default: 1]
         --timeout <timeout>            record a timeout if a response is not received within this amount of time.
 

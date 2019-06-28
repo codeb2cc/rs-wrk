@@ -2,6 +2,7 @@ extern crate clap;
 extern crate crossbeam_channel;
 extern crate ctrlc;
 extern crate futures;
+extern crate hdrhistogram;
 extern crate reqwest;
 extern crate tokio;
 extern crate url;
@@ -18,7 +19,8 @@ use crossbeam_utils::sync::WaitGroup;
 use futures::stream::Concat2;
 use futures::{Async, Future, Poll, Stream};
 use hdrhistogram::Histogram;
-use reqwest::header::HeaderMap;
+use reqwest::header::USER_AGENT;
+use reqwest::header::{HeaderMap, HeaderName};
 use reqwest::r#async::{Client, Decoder, Response};
 use reqwest::Error;
 use tokio::prelude::*;
@@ -82,6 +84,7 @@ impl LoadRunner {
         let client = Client::builder()
             .timeout(config.timeout.unwrap_or(Duration::from_secs(10)))
             .max_idle_per_host(concurrency)
+            .default_headers(config.headers)
             .build()
             .unwrap();
 
@@ -227,11 +230,26 @@ fn _main(args: ArgMatches) {
         Err(_) => None,
     };
 
+    let mut headers = HeaderMap::new();
+    if let Some(custom_headers) = args.values_of("header") {
+        for h in custom_headers {
+            let kv: Vec<&str> = h.splitn(2, ':').collect();
+            if kv.len() == 2 {
+                if let Ok(hdr) = HeaderName::from_bytes(kv[0].as_bytes()) {
+                    headers.append(hdr, kv[1].trim().parse().unwrap());
+                }
+            }
+        }
+    }
+    if !headers.contains_key(USER_AGENT) {
+        headers.insert(USER_AGENT, "rs-wrk/0.1.0".parse().unwrap());
+    }
+
     let load_config = Config {
         url: url.clone(),
         connections,
         duration,
-        headers: HeaderMap::new(),
+        headers,
         timeout,
     };
     println!(
