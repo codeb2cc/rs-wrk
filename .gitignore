@@ -2,3 +2,5 @@
 **/*.rs.bk
 
 .vscode
+perf.data*
+flamegraph.svg

@@ -12,8 +12,8 @@ use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use clap::{load_yaml, value_t, value_t_or_exit, App};
-use crossbeam_channel::{bounded, select, Receiver, Sender, TryRecvError};
+use clap::{load_yaml, value_t, value_t_or_exit, App, ArgMatches};
+use crossbeam_channel::{select, Receiver, Sender, TryRecvError};
 use crossbeam_utils::sync::WaitGroup;
 use futures::stream::Concat2;
 use futures::{Async, Future, Poll, Stream};
@@ -26,7 +26,7 @@ use tokio::timer::Delay;
 use url::Url;
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
-    let (tx, rx) = bounded(1);
+    let (tx, rx) = crossbeam_channel::bounded(1);
     ctrlc::set_handler(move || loop {
         let _ = tx.send(());
     })?;
@@ -184,6 +184,20 @@ impl Stream for LoadRunner {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_main() {
+        let args_def = load_yaml!("rs-wrk.yaml");
+        let args_vec = vec!["rs-wrk", "-d", "10", "-t", "1", "-c", "1", "http://localhost/"];
+        let args = App::from_yaml(args_def).get_matches_from(args_vec);
+
+        _main(args);
+    }
+}
+
 fn run(tx: Sender<ResponseInfo>, ctrlc_rx: Receiver<()>, config: Config) {
     let mut rt = tokio::runtime::current_thread::Runtime::new().unwrap();
 
@@ -193,10 +207,7 @@ fn run(tx: Sender<ResponseInfo>, ctrlc_rx: Receiver<()>, config: Config) {
     let _ = rt.run();
 }
 
-fn main() {
-    let args_def = load_yaml!("rs-wrk.yaml");
-    let args = App::from_yaml(args_def).get_matches();
-
+fn _main(args: ArgMatches) {
     let ctrlc_events = ctrl_channel().unwrap();
 
     let url = match Url::parse(args.value_of("url").unwrap()) {
@@ -266,7 +277,7 @@ fn main() {
     let request_count_th = request_count.clone();
     let response_size_th = response_size.clone();
     // Thread to summarize responses statisitic
-    thread::spawn(move ||  {
+    thread::spawn(move || {
         let mut hist = hist_th.write().unwrap();
         let mut codes = status_codes_th.write().unwrap();
         let mut count = request_count_th.write().unwrap();
@@ -329,4 +340,11 @@ fn main() {
     for (k, v) in status_codes.read().unwrap().iter() {
         println!("\t\t{}: {}({:.2}%)", k, v, v / total_requests * 100);
     }
+}
+
+fn main() {
+    let args_def = load_yaml!("rs-wrk.yaml");
+    let args = App::from_yaml(args_def).get_matches();
+
+    _main(args)
 }
