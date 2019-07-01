@@ -18,13 +18,11 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -c, --connections <connections>    total number of HTTP connections to keep open with each thread handling N =
-                                       connections/threads [default: 1]
+    -c, --connections <connections>    number of HTTP connections to keep open for each thread handling [default: 1]
     -d, --duration <duration>          duration of the test in seconds [default: 10]
-    -H, --header <header>              HTTP header to add to request, e.g. "User-Agent: wrk"
-        --latency <latency>            print detailed latency statistics
+    -H, --header <header>...           HTTP header to add to request, e.g. "User-Agent: wrk"
     -t, --threads <threads>            total number of threads to use [default: 1]
-        --timeout <timeout>            record a timeout if a response is not received within this amount of time.
+        --timeout <timeout>            response timeout in seconds
 
 ARGS:
     <url>    benchmark target

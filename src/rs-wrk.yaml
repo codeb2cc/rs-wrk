@@ -9,7 +9,7 @@ args:
   - connections:
       short: c
       long: connections
-      help: total number of HTTP connections to keep open with each thread handling N = connections/threads
+      help: number of HTTP connections to keep open for each thread handling
       default_value: "1"
       takes_value: true
   - duration:
@@ -31,11 +31,7 @@ args:
       takes_value: true
       multiple: true
       number_of_values: 1
-  - latency:
-      long: latency
-      help: print detailed latency statistics
-      takes_value: true
   - timeout:
       long: timeout
-      help: record a timeout if a response is not received within this amount of time.
+      help: response timeout in seconds
       takes_value: true

@@ -194,7 +194,22 @@ mod tests {
     #[test]
     fn test_main() {
         let args_def = load_yaml!("rs-wrk.yaml");
-        let args_vec = vec!["rs-wrk", "-d", "10", "-t", "1", "-c", "1", "http://localhost/"];
+        let args_vec = vec![
+            "rs-wrk",
+            "-d",
+            "5",
+            "-t",
+            "1",
+            "-c",
+            "2",
+            "-H",
+            "User-Agent: rs-wrk/test",
+            "-H",
+            "X-Custom-Header: FOO",
+            "--timeout",
+            "3",
+            "http://localhost/",
+        ];
         let args = App::from_yaml(args_def).get_matches_from(args_vec);
 
         _main(args);
