@@ -6,6 +6,9 @@ RS-WRK
 
 A wrk like HTTP benchmarking tool in Rust.
 
+
+*IMPORTANT* This project is being rewriting with the new `async/await` and the `threads` and `timeout` options are temporarily broken. For stable usage please switch to the `v0.1.x` branch.
+
 Usage
 ----
 
