@@ -313,6 +313,32 @@ fn summary(timeout: Option<Duration>, rx: Receiver<ResponseInfo>) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_main() {
+        let args_def = load_yaml!("rs-wrk.yaml");
+        let args_vec = vec![
+            "rs-wrk",
+            "-d",
+            "5",
+            "-c",
+            "2",
+            "-H",
+            "User-Agent: rs-wrk/test",
+            "-H",
+            "X-Custom-Header: FOO",
+            "http://localhost/",
+        ];
+        let args = App::from_yaml(args_def).get_matches_from(args_vec);
+
+        let mut rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(_main(&args)).unwrap();
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args_def = load_yaml!("rs-wrk.yaml");
