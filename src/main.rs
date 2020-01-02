@@ -250,7 +250,7 @@ async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + 
 fn summary(timeout: Option<Duration>, rx: Receiver<ResponseInfo>) {
     let mut hist = match timeout {
         Some(d) => Histogram::<u64>::new_with_bounds(1, d.as_millis() as u64 * 2, 2).unwrap(),
-        None => Histogram::<u64>::new_with_bounds(1, 60 * 1000, 2).unwrap(),
+        None => Histogram::<u64>::new_with_bounds(1, 10 * 1000, 2).unwrap(),
     };
 
     let mut status_codes = HashMap::<StatusCode, u64>::new();
@@ -311,6 +311,17 @@ fn summary(timeout: Option<Duration>, rx: Receiver<ResponseInfo>) {
     for (k, v) in status_codes.iter() {
         println!("\t\t{}: {}({:.2}%)", k, v, v / request_count * 100);
     }
+
+    println!("\tPercentage of the requests served within a certain time (ms): ");
+    println!("\t\t25%: {:.2}", hist.value_at_quantile(0.25));
+    println!("\t\t33%: {:.2}", hist.value_at_quantile(0.33));
+    println!("\t\t50%: {:.2}", hist.value_at_quantile(0.5));
+    println!("\t\t66%: {:.2}", hist.value_at_quantile(0.66));
+    println!("\t\t75%: {:.2}", hist.value_at_quantile(0.75));
+    println!("\t\t80%: {:.2}", hist.value_at_quantile(0.8));
+    println!("\t\t90%: {:.2}", hist.value_at_quantile(0.9));
+    println!("\t\t95%: {:.2}", hist.value_at_quantile(0.95));
+    println!("\t\t99%: {:.2}", hist.value_at_quantile(0.99));
 }
 
 #[cfg(test)]
