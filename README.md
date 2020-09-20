@@ -6,9 +6,6 @@ RS-WRK
 
 A wrk like HTTP benchmarking tool in Rust.
 
-
-*IMPORTANT* This project is being rewriting with the new `async/await` and the `threads` and `timeout` options are temporarily broken. For stable usage please switch to the `v0.1.x` branch.
-
 Usage
 ----
 
@@ -21,11 +18,11 @@ FLAGS:
     -V, --version    Prints version information
 
 OPTIONS:
-    -c, --connections <connections>    number of HTTP connections to keep open for each thread handling [default: 1]
+    -c, --connections <connections>    number of concurrent HTTP connections [default: 1]
     -d, --duration <duration>          duration of the test in seconds [default: 10]
     -H, --header <header>...           HTTP header to add to request, e.g. "User-Agent: wrk"
     -t, --threads <threads>            total number of threads to use [default: 1]
-        --timeout <timeout>            response timeout in seconds
+        --timeout <timeout>            response timeout in milliseconds
 
 ARGS:
     <url>    benchmark target

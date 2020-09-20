@@ -1,5 +1,5 @@
 name: rs-wrk
-version: "0.1.0"
+version: "0.2.0"
 
 args:
   - url:
@@ -9,7 +9,7 @@ args:
   - connections:
       short: c
       long: connections
-      help: number of HTTP connections to keep open for each thread handling
+      help: number of concurrent HTTP connections
       default_value: "1"
       takes_value: true
   - duration:
@@ -33,5 +33,5 @@ args:
       number_of_values: 1
   - timeout:
       long: timeout
-      help: response timeout in seconds
+      help: response timeout in milliseconds
       takes_value: true

@@ -16,8 +16,8 @@ use futures::{
 };
 use hdrhistogram::Histogram;
 use http::{
-    header::{HeaderName, CONTENT_LENGTH, USER_AGENT},
-    HeaderMap, StatusCode,
+    header::{HeaderName, USER_AGENT},
+    HeaderMap, Response, StatusCode,
 };
 use hyper::{
     body::Body,
@@ -25,7 +25,7 @@ use hyper::{
     Method, Request,
 };
 use hyper_tls::HttpsConnector;
-use tokio::time::delay_for;
+use tokio::{runtime::Builder, time::delay_for};
 use url::Url;
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -43,7 +43,7 @@ struct Config {
     pub connections: u32,
     pub duration: Duration,
     pub headers: HeaderMap,
-    pub timeout: Option<Duration>,
+    pub timeout: Duration,
 }
 
 #[allow(dead_code)]
@@ -55,6 +55,7 @@ struct LoadRunner {
     request_count: u64,
     response_count: u64,
     error_count: u64,
+    timeout_count: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -95,8 +96,7 @@ impl LoadRunner {
     pub fn new(config: Config, ctrlc_rx: Receiver<()>, resp_tx: Sender<ResponseInfo>) -> LoadRunner {
         let https = HttpsConnector::new();
         let client = Client::builder()
-            .keep_alive(true)
-            .max_idle_per_host(10)
+            .pool_max_idle_per_host(config.connections as usize)
             .build::<_, hyper::Body>(https);
 
         LoadRunner {
@@ -107,6 +107,7 @@ impl LoadRunner {
             request_count: 0,
             response_count: 0,
             error_count: 0,
+            timeout_count: 0,
         }
     }
 
@@ -124,9 +125,9 @@ impl LoadRunner {
         req
     }
 
-    #[allow(clippy::unnecessary_mut_passed)] // TODO: Seems like a Rust/clippy bug
     pub async fn run(&mut self) {
-        let delay = delay_for(self.config.duration).fuse();
+        let start = Instant::now();
+        let delay = delay_for(self.config.duration + self.config.timeout).fuse();
         pin_mut!(delay);
 
         let mut reqs = FuturesUnordered::<WrappedFuture<ResponseFuture>>::new();
@@ -146,40 +147,59 @@ impl LoadRunner {
                 _ = delay => {
                     break;
                 },
-                (res, start) = reqs.select_next_some() => {
+                (res, req_start) = reqs.select_next_some() => {
                     match res {
-                        Ok(mut response) => {
-                            let status = response.status();
-                            let mut content_length = String::from("-");
-                            if let Some(v) = response.headers().get(CONTENT_LENGTH) {
-                                if let Ok(len) = v.to_str() {
-                                    content_length = String::from(len);
-                                }
-                            };
-                            let body_len = response.body_mut().fold(0, |acc, chunk| async move {
-                                acc + chunk.unwrap().len()
-                            }).await;       // TODO: This implement blocks other requests
-
-                            self.response_count += 1;
-                            let _ = self.resp_tx.send(ResponseInfo {
-                                code: status,
-                                time: start.elapsed(),
-                                content_lenght: body_len as u64,
-                            });
-                        }
                         Err(e) => {
                             self.error_count += 1;
                             println!("Error: {:?}", e);
                         }
-                    };
-                    reqs.push(WrappedFuture::new(self.http_client.request(self.build_request())));
+                        Ok(mut response) => {
+                            self.process_response(response, req_start).await;
+                        }
+                    }
+
+                    // Start another new request
+                    if (start.elapsed() < self.config.duration) {
+                        reqs.push(WrappedFuture::new(self.http_client.request(self.build_request())));
+                        self.request_count += 1;
+                    }
                 }
             };
         }
     }
+
+    async fn process_response(&mut self, mut response: Response<Body>, start: Instant) {
+        let status = response.status();
+        if start.elapsed() >= self.config.timeout {
+            self.timeout_count += 1;
+            return;
+        }
+
+        let timeout = delay_for(self.config.timeout - start.elapsed()).fuse();
+        pin_mut!(timeout);
+        loop {
+            select! {
+                _ = timeout => {
+                    self.timeout_count += 1;
+                    break;
+                },
+                body_len = response.body_mut().fold(0, |acc, chunk| async move {
+                    acc + chunk.unwrap().len()
+                }) => {
+                    self.response_count += 1;
+                    let _ = self.resp_tx.send(ResponseInfo {
+                        code: status,
+                        time: start.elapsed(),
+                        content_lenght: body_len as u64,
+                    });
+                    break;
+                }
+            }
+        }
+    }
 }
 
-async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn _main(args: &ArgMatches<'_>) {
     let ctrlc_events = ctrl_channel().unwrap();
 
     let url = match Url::parse(args.value_of("url").unwrap()) {
@@ -195,8 +215,8 @@ async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + 
     let duration_seconds = value_t_or_exit!(args.value_of("duration"), u32);
     let duration = Duration::new(u64::from(duration_seconds), 0);
     let timeout = match value_t!(args.value_of("timeout"), u32) {
-        Ok(seconds) => Some(Duration::new(u64::from(seconds), 0)),
-        Err(_) => None,
+        Ok(ms) => Duration::new(0, ms * 1_000_000),
+        Err(_) => Duration::new(30, 0),
     };
 
     let mut headers = HeaderMap::new();
@@ -211,7 +231,7 @@ async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + 
         }
     }
     if !headers.contains_key(USER_AGENT) {
-        headers.insert(USER_AGENT, "rs-wrk/0.1.0".parse().unwrap());
+        headers.insert(USER_AGENT, "rs-wrk/0.2.0".parse().unwrap());
     }
 
     let load_config = Config {
@@ -222,9 +242,10 @@ async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + 
         timeout,
     };
     println!(
-        "=> Running {:?} test @ {}\n\t{} threads and {} connections per thread",
+        "=> Running {:?} test @ {}\n\t{}ms timeout, {} threads and {} concurrent connections",
         duration,
         url.as_str(),
+        timeout.as_millis(),
         threads,
         connections,
     );
@@ -241,17 +262,15 @@ async fn _main(args: &ArgMatches<'_>) -> Result<(), Box<dyn std::error::Error + 
         .unwrap();
 
     runner.run().await;
-    drop(runner); // Drop runner.resp_tx
+    drop(runner.resp_tx);
     let _ = h.join();
-
-    Ok(())
+    println!("\tRequests: {}", runner.request_count);
+    println!("\tErrors: {}", runner.error_count);
+    println!("\tTimeouts: {}", runner.timeout_count);
 }
 
-fn summary(timeout: Option<Duration>, rx: Receiver<ResponseInfo>) {
-    let mut hist = match timeout {
-        Some(d) => Histogram::<u64>::new_with_bounds(1, d.as_millis() as u64 * 2, 2).unwrap(),
-        None => Histogram::<u64>::new_with_bounds(1, 10 * 1000, 2).unwrap(),
-    };
+fn summary(timeout: Duration, rx: Receiver<ResponseInfo>) {
+    let mut hist = Histogram::<u64>::new_with_bounds(1, timeout.as_millis() as u64 * 2, 2).unwrap();
 
     let mut status_codes = HashMap::<StatusCode, u64>::new();
     let mut request_count = 0;
@@ -350,10 +369,17 @@ mod tests {
     }
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() {
     let args_def = load_yaml!("rs-wrk.yaml");
     let args = App::from_yaml(args_def).get_matches();
 
-    _main(&args).await
+    let threads = value_t_or_exit!(args.value_of("threads"), u32);
+
+    let mut rt = Builder::new()
+        .threaded_scheduler()
+        .enable_all()
+        .core_threads(threads as usize)
+        .build()
+        .unwrap();
+    rt.block_on(_main(&args));
 }
